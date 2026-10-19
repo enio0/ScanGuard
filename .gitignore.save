@@ -1,0 +1,23 @@
+Virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE files
+.vscode/
+
+# System files
+.DS_Store
+
+# Local secrets
+.env
+.env.*
+
+# AI models
+*.pt
+
+# Backup files
+*.save
