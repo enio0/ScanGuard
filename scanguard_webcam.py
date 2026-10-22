@@ -45,33 +45,41 @@ tracks = {}                  # id -> {"pos":(x,y), "last":t, "counted":bool}
 next_id = 0
 
 
-def update_tracks(detections, zone_x):
-    """Greedy nearest-neighbour tracking + line-cross counting."""
-    global next_id, camera_count
-    now = time.time()
-    unmatched = list(detections)
+def update_tracks(results, zone_x):
+    global camera_count
 
-    for tid, tr in list(tracks.items()):
-        best, best_d = None, MATCH_DIST
-        for d in unmatched:
-            dx, dy = d[0] - tr["pos"][0], d[1] - tr["pos"][1]
-            dist = (dx * dx + dy * dy) ** 0.5
-            if dist < best_d:
-                best, best_d = d, dist
-        if best is not None:
-            prev_x = tr["pos"][0]
-            tr["pos"], tr["last"] = (best[0], best[1]), now
-            unmatched.remove(best)
-            # count once when centroid crosses the zone line left -> right
-            if not tr["counted"] and prev_x < zone_x <= best[0]:
-                tr["counted"] = True
-                camera_count += 1
-        elif now - tr["last"] > TRACK_TTL:
-            del tracks[tid]
+    if results.boxes.id is None:
+        return
 
-    for d in unmatched:
-        tracks[next_id] = {"pos": (d[0], d[1]), "last": now, "counted": False}
-        next_id += 1
+    for box in results.boxes:
+        name = model.names[int(box.cls)]
+
+        if name not in CLASSES_OF_INTEREST:
+            continue
+
+        track_id = int(box.id.item())
+
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        center_x = (x1 + x2) // 2
+
+        if track_id not in tracks:
+            tracks[track_id] = {
+                "previous_x": center_x,
+                "counted": False
+            }
+            continue
+
+        previous_x = tracks[track_id]["previous_x"]
+
+        if (
+            not tracks[track_id]["counted"]
+            and previous_x < zone_x <= center_x
+        ):
+            camera_count += 1
+            tracks[track_id]["counted"] = True
+            print(f"Product counted! ID: {track_id}")
+
+        tracks[track_id]["previous_x"] = center_x
 
 
 def main():
@@ -88,7 +96,15 @@ def main():
         zone_x = int(w * ZONE_X_RATIO)
 
         # ---- detect ----
-        results = model(frame, conf=CONF, verbose=False)[0]
+        results = model.track(
+            frame,
+            persist=True,
+            tracker="bytetrack.yaml",
+            conf=CONF,
+            verbose=False
+            )[0]
+        print("Detected objects:", len(results.boxes))
+        print("Tracking IDs:", results.boxes.id)        
         dets = []
         for box in results.boxes:
             name = model.names[int(box.cls)]
@@ -101,7 +117,7 @@ def main():
             cv2.putText(frame, name, (x1, y1 - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (90, 220, 140), 1)
 
-        update_tracks(dets, zone_x)
+        update_tracks(results, zone_x)
 
         # ---- overlay ----
         cv2.line(frame, (zone_x, 0), (zone_x, h), (90, 220, 140), 2)
