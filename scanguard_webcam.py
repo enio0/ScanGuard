@@ -2,8 +2,12 @@
 """
 ScanGuard — AI-Powered Smart Checkout Monitoring
 ================================================
-Detects and tracks objects crossing a virtual line using YOLOv8
-and ByteTrack, comparing them against simulated checkout scans.
+Version 1.2 — Improved Object Tracking
+
+Detects and tracks objects crossing a virtual detection zone
+using YOLOv8 and ByteTrack.
+
+Compares camera detections with simulated checkout scans.
 
 Controls:
     S     -> Scan an item
@@ -14,6 +18,7 @@ Controls:
 
 import cv2
 import time
+from pathlib import Path
 from ultralytics import YOLO
 
 
@@ -33,7 +38,18 @@ WHITE = (255, 255, 255)
 ORANGE = (0, 165, 255)
 RED = (50, 50, 230)
 
-model = YOLO("yolov8n.pt")
+BASE_DIR = Path(__file__).resolve().parent
+
+MODEL_PATH = BASE_DIR / "yolov8n.pt"
+TRACKER_PATH = BASE_DIR / "custom_bytetrack.yaml"
+
+if not TRACKER_PATH.is_file():
+    raise SystemExit(
+        "Missing custom_bytetrack.yaml. "
+        "Create it in the same folder as scanguard_webcam.py."
+    )
+
+model = YOLO(str(MODEL_PATH))
 
 
 # ---------- GLOBAL VARIABLES ----------
@@ -78,16 +94,17 @@ def update_tracks(results, zone_x):
 
         current = tracks[track_id]
 
-        # Object must first reach the left zone
+        # Object reaches the left zone
         if center_x <= left_limit:
             current["armed"] = True
 
-        # Count when it reaches the right zone
+        # Object moves from left zone to right zone
         if (
             current["armed"]
             and not current["counted"]
             and center_x >= right_limit
         ):
+
             camera_count += 1
             current["counted"] = True
 
@@ -95,14 +112,71 @@ def update_tracks(results, zone_x):
                 f"Product counted! "
                 f"ID: {track_id} | "
                 f"Class: {name} | "
-                f"Total: {camera_count}"
+                f"Camera total: {camera_count}"
             )
+
+
+# ---------- RESET TRANSACTION ----------
+
+def reset_transaction():
+    global camera_count, scanned_count, verdict
+
+    camera_count = 0
+    scanned_count = 0
+    verdict = None
+
+    tracks.clear()
+
+    # Reset ByteTrack's internal tracking state
+    if model.predictor is not None:
+
+        trackers = getattr(
+            model.predictor,
+            "trackers",
+            []
+        )
+
+        for tracker in trackers:
+            tracker.reset()
+
+    print("Transaction reset.")
+
+
+# ---------- PAYMENT CHECK ----------
+
+def check_payment():
+    global verdict
+
+    if scanned_count >= camera_count:
+
+        verdict = (
+            "ok",
+            f"CLEARED: {camera_count} detected / "
+            f"{scanned_count} scanned",
+            time.time()
+        )
+
+        print("Transaction cleared.")
+
+    else:
+
+        difference = camera_count - scanned_count
+
+        verdict = (
+            "alarm",
+            f"ALERT: {difference} potentially unscanned item(s)",
+            time.time()
+        )
+
+        print(
+            f"ALERT: {difference} potentially unscanned item(s)."
+        )
 
 
 # ---------- MAIN APPLICATION ----------
 
 def main():
-    global camera_count, scanned_count, verdict
+    global scanned_count
 
     cap = cv2.VideoCapture(0)
 
@@ -110,6 +184,7 @@ def main():
         raise SystemExit("No webcam found (index 0).")
 
     try:
+
         while True:
 
             ok, frame = cap.read()
@@ -119,17 +194,18 @@ def main():
                 break
 
             h, w = frame.shape[:2]
+
             zone_x = int(w * ZONE_X_RATIO)
 
             left_limit = zone_x - ZONE_MARGIN
             right_limit = zone_x + ZONE_MARGIN
 
-            # ---------- YOLO + BYTETRACK ----------
+            # ---------- YOLO + CUSTOM BYTETRACK ----------
 
             results = model.track(
                 frame,
                 persist=True,
-                tracker="bytetrack.yaml",
+                tracker=str(TRACKER_PATH),
                 conf=CONF,
                 verbose=False
             )[0]
@@ -138,7 +214,7 @@ def main():
 
             update_tracks(results, zone_x)
 
-            # ---------- DRAW DETECTIONS ----------
+            # ---------- DRAW DETECTED OBJECTS ----------
 
             for box in results.boxes:
 
@@ -157,15 +233,17 @@ def main():
 
                 label = f"{name} ID:{track_id}"
 
-                # Use orange for an object already counted
+                # Orange means the object was already counted
                 if (
                     track_id in tracks
                     and tracks[track_id]["counted"]
                 ):
                     color = ORANGE
+
                 else:
                     color = GREEN
 
+                # Draw bounding box
                 cv2.rectangle(
                     frame,
                     (x1, y1),
@@ -174,6 +252,7 @@ def main():
                     2
                 )
 
+                # Display object class and tracking ID
                 cv2.putText(
                     frame,
                     label,
@@ -190,16 +269,16 @@ def main():
             cv2.line(
                 frame,
                 (left_limit, 0),
-                (left_limit, h - 70),
+                (left_limit, h - 80),
                 ORANGE,
                 1
             )
 
-            # Central detection line
+            # Central line
             cv2.line(
                 frame,
                 (zone_x, 0),
-                (zone_x, h - 70),
+                (zone_x, h - 80),
                 GREEN,
                 2
             )
@@ -208,7 +287,7 @@ def main():
             cv2.line(
                 frame,
                 (right_limit, 0),
-                (right_limit, h - 70),
+                (right_limit, h - 80),
                 ORANGE,
                 1
             )
@@ -291,9 +370,9 @@ def main():
                     2
                 )
 
-            # ---------- SHOW WEBCAM ----------
+            # ---------- DISPLAY WEBCAM ----------
 
-            cv2.imshow("ScanGuard - ByteTrack v1.1", frame)
+            cv2.imshow("ScanGuard - ByteTrack v1.2", frame)
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -303,6 +382,7 @@ def main():
 
             # Simulate product scan
             elif key == ord("s"):
+
                 scanned_count += 1
 
                 print(
@@ -313,56 +393,15 @@ def main():
             # Reset transaction
             elif key == ord("r"):
 
-                camera_count = 0
-                scanned_count = 0
-                tracks.clear()
-                verdict = None
-
-                # Reset ByteTrack internal state
-                if model.predictor is not None:
-
-                    trackers = getattr(
-                        model.predictor,
-                        "trackers",
-                        []
-                    )
-
-                    for tracker in trackers:
-                        tracker.reset()
-
-                print("Transaction reset.")
+                reset_transaction()
 
             # Finish payment
             elif key == ord("p"):
 
-                if scanned_count >= camera_count:
-
-                    verdict = (
-                        "ok",
-                        f"CLEARED: {camera_count} detected / "
-                        f"{scanned_count} scanned",
-                        time.time()
-                    )
-
-                    print("Transaction cleared.")
-
-                else:
-
-                    difference = camera_count - scanned_count
-
-                    verdict = (
-                        "alarm",
-                        f"ALERT: {difference} potentially unscanned "
-                        f"item(s)",
-                        time.time()
-                    )
-
-                    print(
-                        f"ALERT: {difference} potentially "
-                        f"unscanned item(s)."
-                    )
+                check_payment()
 
     finally:
+
         cap.release()
         cv2.destroyAllWindows()
 
