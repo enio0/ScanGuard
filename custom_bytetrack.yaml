@@ -1,18 +1,17 @@
 
-# ScanGuard Custom ByteTrack Configuration
+# ScanGuard v1.3.1
+# Custom ByteTrack Configuration
 
 tracker_type: bytetrack
 
-# Detection matching thresholds
-track_high_thresh: 0.25
+# Detection association thresholds
+track_high_thresh: 0.20
 track_low_thresh: 0.10
-new_track_thresh: 0.25
+new_track_thresh: 0.20
 
-# Keep temporarily lost objects for more frames
+# Keep lost tracks for up to 60 frames
 track_buffer: 60
 
-# More lenient matching between detections
+# Matching configuration
 match_thresh: 0.85
-
-# Combine detection confidence with matching
 fuse_score: True

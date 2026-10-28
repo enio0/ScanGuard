@@ -2,18 +2,20 @@
 """
 ScanGuard — AI-Powered Smart Checkout Monitoring
 ================================================
-Version 1.3 — Duplicate Count Prevention
+Version 1.3.1 — Improved Detection
 
 Features:
 - YOLOv8 object detection
 - ByteTrack object tracking
-- Left-to-right crossing detection
+- Improved detection of smaller objects
+- Tracking IDs displayed on webcam
+- Detection zone with hysteresis
 - Temporary tracking ID recovery
-- Duplicate count reduction
-- Simulated checkout and payment verification
+- Simulated product scanning
+- Payment discrepancy alerts
 
 Controls:
-    S     -> Scan a product
+    S     -> Scan an item
     P     -> Finish payment
     R     -> Reset transaction
     Q/Esc -> Quit
@@ -32,20 +34,30 @@ CLASSES_OF_INTEREST = {
     "book", "cell phone", "remote", "mouse", "scissors"
 }
 
+# Detection
+CONF = 0.20
+IMAGE_SIZE = 960
+
+# Webcam requested resolution
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+
+# Counting zone
 ZONE_X_RATIO = 0.55
 ZONE_MARGIN = 25
-CONF = 0.4
 
-# Temporary tracking ID recovery
+# Temporary object recovery
 RECONNECT_DISTANCE = 70
 RECONNECT_TIME = 1.5
 
-# Colors (OpenCV uses BGR)
+# Colors (BGR)
 GREEN = (90, 220, 140)
 WHITE = (255, 255, 255)
 ORANGE = (0, 165, 255)
 RED = (50, 50, 230)
+DARK = (25, 25, 25)
 
+# Files
 BASE_DIR = Path(__file__).resolve().parent
 
 MODEL_PATH = BASE_DIR / "yolov8n.pt"
@@ -53,7 +65,7 @@ TRACKER_PATH = BASE_DIR / "custom_bytetrack.yaml"
 
 if not TRACKER_PATH.is_file():
     raise SystemExit(
-        "Missing custom_bytetrack.yaml."
+        "Missing custom_bytetrack.yaml"
     )
 
 model = YOLO(str(MODEL_PATH))
@@ -66,11 +78,7 @@ scanned_count = 0
 verdict = None
 
 # Each tracked object stores:
-# center: last known position
-# name: detected object class
-# last_seen: last detection time
-# armed: object observed left of the zone
-# counted: object already counted
+# center, name, last_seen, armed, counted
 tracks = {}
 
 
@@ -87,133 +95,132 @@ def update_tracks(results, zone_x):
 
     active_ids = set()
 
-    # Find all currently tracked IDs
-    if results.boxes.id is not None:
+    # Collect visible tracking IDs
+    for box in results.boxes:
 
-        for box in results.boxes:
+        name = model.names[int(box.cls.item())]
 
-            name = model.names[int(box.cls)]
+        if name not in CLASSES_OF_INTEREST:
+            continue
 
-            if name not in CLASSES_OF_INTEREST:
-                continue
-
+        if box.id is not None:
             active_ids.add(int(box.id.item()))
 
-        # Process tracked objects
-        for box in results.boxes:
+    # Process tracked detections
+    for box in results.boxes:
 
-            name = model.names[int(box.cls)]
+        name = model.names[int(box.cls.item())]
 
-            if name not in CLASSES_OF_INTEREST:
-                continue
+        if name not in CLASSES_OF_INTEREST:
+            continue
 
-            track_id = int(box.id.item())
+        # Some YOLO detections do not have a tracking ID
+        if box.id is None:
+            continue
 
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+        track_id = int(box.id.item())
 
-            center_x = (x1 + x2) // 2
-            center_y = (y1 + y2) // 2
+        x1, y1, x2, y2 = map(
+            int, box.xyxy[0].tolist()
+        )
 
-            # ---------- NEW TRACKING ID ----------
+        center_x = (x1 + x2) // 2
+        center_y = (y1 + y2) // 2
 
-            if track_id not in tracks:
+        # ---------- NEW TRACK ----------
 
-                previous_id = None
-                best_distance = RECONNECT_DISTANCE
+        if track_id not in tracks:
 
-                # Search recently disappeared objects
-                for old_id, old in tracks.items():
+            previous_id = None
+            best_distance = RECONNECT_DISTANCE
 
-                    # Never match an object still visible
-                    if old_id in active_ids:
-                        continue
+            # Try to reconnect a recently lost track
+            for old_id, old in tracks.items():
 
-                    # Only recover previously counted objects
-                    if not old["counted"]:
-                        continue
+                if old_id in active_ids:
+                    continue
 
-                    # Require matching object category
-                    if old["name"] != name:
-                        continue
+                if not old["counted"]:
+                    continue
 
-                    # Require recent disappearance
-                    if now - old["last_seen"] > RECONNECT_TIME:
-                        continue
+                if old["name"] != name:
+                    continue
 
-                    old_x, old_y = old["center"]
+                age = now - old["last_seen"]
 
-                    dx = center_x - old_x
-                    dy = center_y - old_y
+                if age > RECONNECT_TIME:
+                    continue
 
-                    distance = (dx * dx + dy * dy) ** 0.5
+                old_x, old_y = old["center"]
 
-                    if distance < best_distance:
+                dx = center_x - old_x
+                dy = center_y - old_y
 
-                        best_distance = distance
-                        previous_id = old_id
+                distance = (dx * dx + dy * dy) ** 0.5
 
-                # ---------- RECOVER OLD OBJECT ----------
+                if distance < best_distance:
 
-                if previous_id is not None:
+                    best_distance = distance
+                    previous_id = old_id
 
-                    old_track = tracks.pop(previous_id)
+            # Recover possible previous identity
+            if previous_id is not None:
 
-                    tracks[track_id] = {
-                        "center": (center_x, center_y),
-                        "name": name,
-                        "last_seen": now,
-                        "armed": old_track["armed"],
-                        "counted": True
-                    }
+                old_track = tracks.pop(previous_id)
 
-                    print(
-                        f"Possible ID recovery: "
-                        f"{previous_id} -> {track_id}"
-                    )
-
-                # ---------- CREATE NEW OBJECT ----------
-
-                else:
-
-                    tracks[track_id] = {
-                        "center": (center_x, center_y),
-                        "name": name,
-                        "last_seen": now,
-                        "armed": False,
-                        "counted": False
-                    }
-
-            # ---------- UPDATE OBJECT STATE ----------
-
-            current = tracks[track_id]
-
-            # Arm object when it reaches the left zone
-            if center_x <= left_limit:
-                current["armed"] = True
-
-            # Count when it reaches the right zone
-            if (
-                current["armed"]
-                and not current["counted"]
-                and center_x >= right_limit
-            ):
-
-                camera_count += 1
-                current["counted"] = True
+                tracks[track_id] = {
+                    "center": (center_x, center_y),
+                    "name": name,
+                    "last_seen": now,
+                    "armed": old_track["armed"],
+                    "counted": True
+                }
 
                 print(
-                    f"Product counted! "
-                    f"ID: {track_id} | "
-                    f"Class: {name} | "
-                    f"Total: {camera_count}"
+                    f"Possible ID recovery: "
+                    f"{previous_id} -> {track_id}"
                 )
 
-            # Save latest position and timestamp
-            current["center"] = (center_x, center_y)
-            current["name"] = name
-            current["last_seen"] = now
+            else:
 
-    # ---------- CLEAN OLD TRACKS ----------
+                tracks[track_id] = {
+                    "center": (center_x, center_y),
+                    "name": name,
+                    "last_seen": now,
+                    "armed": False,
+                    "counted": False
+                }
+
+        # ---------- UPDATE TRACK ----------
+
+        current = tracks[track_id]
+
+        # Arm object on the left
+        if center_x <= left_limit:
+            current["armed"] = True
+
+        # Count when reaching the right side
+        if (
+            current["armed"]
+            and not current["counted"]
+            and center_x >= right_limit
+        ):
+
+            camera_count += 1
+            current["counted"] = True
+
+            print(
+                f"COUNTED: {name} | "
+                f"ID: {track_id} | "
+                f"Total: {camera_count}"
+            )
+
+        # Save latest information
+        current["center"] = (center_x, center_y)
+        current["name"] = name
+        current["last_seen"] = now
+
+    # ---------- REMOVE OLD RECORDS ----------
 
     for old_id in list(tracks):
 
@@ -238,7 +245,7 @@ def reset_transaction():
 
     tracks.clear()
 
-    # Reset ByteTrack's internal state
+    # Reset ByteTrack
     if model.predictor is not None:
 
         trackers = getattr(
@@ -285,6 +292,202 @@ def check_payment():
         )
 
 
+# ---------- DRAW INTERFACE ----------
+
+def draw_interface(frame, results, zone_x, fps):
+
+    h, w = frame.shape[:2]
+
+    left_limit = zone_x - ZONE_MARGIN
+    right_limit = zone_x + ZONE_MARGIN
+
+    # ---------- DETECTED OBJECTS ----------
+
+    detections = 0
+    tracked = 0
+
+    for box in results.boxes:
+
+        name = model.names[int(box.cls.item())]
+
+        if name not in CLASSES_OF_INTEREST:
+            continue
+
+        detections += 1
+
+        x1, y1, x2, y2 = map(
+            int, box.xyxy[0].tolist()
+        )
+
+        confidence = float(box.conf.item())
+
+        if box.id is not None:
+
+            track_id = int(box.id.item())
+            tracked += 1
+
+            counted = (
+                track_id in tracks
+                and tracks[track_id]["counted"]
+            )
+
+            if counted:
+                color = ORANGE
+                status = "COUNTED"
+            else:
+                color = GREEN
+                status = ""
+
+            label = (
+                f"{name} ID:{track_id} "
+                f"{confidence:.2f} {status}"
+            )
+
+        else:
+
+            # Still display detections without tracking IDs
+            color = ORANGE
+
+            label = (
+                f"{name} {confidence:.2f} "
+                f"UNTRACKED"
+            )
+
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            color,
+            2
+        )
+
+        cv2.putText(
+            frame,
+            label,
+            (x1, max(y1 - 8, 15)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2
+        )
+
+    # ---------- DETECTION ZONE ----------
+
+    for position, color, thickness in [
+        (left_limit, ORANGE, 1),
+        (zone_x, GREEN, 2),
+        (right_limit, ORANGE, 1)
+    ]:
+
+        cv2.line(
+            frame,
+            (position, 35),
+            (position, h - 90),
+            color,
+            thickness
+        )
+
+    # ---------- TOP INFORMATION ----------
+
+    cv2.rectangle(
+        frame,
+        (0, 0),
+        (w, 75),
+        DARK,
+        -1
+    )
+
+    cv2.putText(
+        frame,
+        "ScanGuard v1.3.1 - Improved Detection",
+        (12, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        GREEN,
+        2
+    )
+
+    cv2.putText(
+        frame,
+        f"Detected: {detections} | "
+        f"Tracked: {tracked} | "
+        f"FPS: {fps:.1f}",
+        (12, 55),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        WHITE,
+        1
+    )
+
+    # ---------- BOTTOM DASHBOARD ----------
+
+    cv2.rectangle(
+        frame,
+        (0, h - 90),
+        (w, h),
+        DARK,
+        -1
+    )
+
+    cv2.putText(
+        frame,
+        f"CAMERA: {camera_count}",
+        (12, h - 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        GREEN,
+        2
+    )
+
+    cv2.putText(
+        frame,
+        f"SCANNED: {scanned_count}",
+        (12, h - 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        WHITE,
+        2
+    )
+
+    cv2.putText(
+        frame,
+        "[S] Scan  [P] Pay  [R] Reset  [Q] Quit",
+        (12, h - 7),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        WHITE,
+        1
+    )
+
+    # ---------- PAYMENT ALERT ----------
+
+    if verdict and time.monotonic() - verdict[2] < 5:
+
+        color = (
+            GREEN
+            if verdict[0] == "ok"
+            else RED
+        )
+
+        cv2.rectangle(
+            frame,
+            (0, 80),
+            (w, 125),
+            color,
+            -1
+        )
+
+        cv2.putText(
+            frame,
+            verdict[1],
+            (12, 108),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            WHITE,
+            2
+        )
+
+
 # ---------- MAIN APPLICATION ----------
 
 def main():
@@ -293,8 +496,29 @@ def main():
 
     cap = cv2.VideoCapture(0)
 
+    # Request higher webcam resolution
+    cap.set(
+        cv2.CAP_PROP_FRAME_WIDTH,
+        CAMERA_WIDTH
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_HEIGHT,
+        CAMERA_HEIGHT
+    )
+
     if not cap.isOpened():
-        raise SystemExit("No webcam found (index 0).")
+        raise SystemExit("No webcam found.")
+
+    actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+
+    print(
+        f"Camera resolution: "
+        f"{actual_width:.0f}x{actual_height:.0f}"
+    )
+
+    previous_time = time.monotonic()
 
     try:
 
@@ -310,9 +534,6 @@ def main():
 
             zone_x = int(w * ZONE_X_RATIO)
 
-            left_limit = zone_x - ZONE_MARGIN
-            right_limit = zone_x + ZONE_MARGIN
-
             # ---------- YOLO + BYTETRACK ----------
 
             results = model.track(
@@ -320,173 +541,41 @@ def main():
                 persist=True,
                 tracker=str(TRACKER_PATH),
                 conf=CONF,
+                imgsz=IMAGE_SIZE,
                 verbose=False
             )[0]
 
-            # ---------- UPDATE TRACKS ----------
+            # ---------- UPDATE OBJECT COUNT ----------
 
             update_tracks(results, zone_x)
 
-            # ---------- DRAW DETECTED OBJECTS ----------
+            # ---------- FPS ----------
 
-            for box in results.boxes:
+            current_time = time.monotonic()
+            elapsed = current_time - previous_time
 
-                name = model.names[int(box.cls)]
+            if elapsed > 0:
+                fps = 1.0 / elapsed
+            else:
+                fps = 0.0
 
-                if name not in CLASSES_OF_INTEREST:
-                    continue
+            previous_time = current_time
 
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+            # ---------- DRAW INTERFACE ----------
 
-                track_id = (
-                    int(box.id.item())
-                    if box.id is not None
-                    else -1
-                )
-
-                # Check whether object was counted
-                counted = (
-                    track_id in tracks
-                    and tracks[track_id]["counted"]
-                )
-
-                if counted:
-                    color = ORANGE
-                    label = f"{name} ID:{track_id} COUNTED"
-
-                else:
-                    color = GREEN
-                    label = f"{name} ID:{track_id}"
-
-                # Bounding box
-                cv2.rectangle(
-                    frame,
-                    (x1, y1),
-                    (x2, y2),
-                    color,
-                    2
-                )
-
-                # Object label
-                cv2.putText(
-                    frame,
-                    label,
-                    (x1, max(y1 - 6, 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    color,
-                    2
-                )
-
-            # ---------- DETECTION ZONE ----------
-
-            cv2.line(
+            draw_interface(
                 frame,
-                (left_limit, 0),
-                (left_limit, h - 80),
-                ORANGE,
-                1
+                results,
+                zone_x,
+                fps
             )
-
-            cv2.line(
-                frame,
-                (zone_x, 0),
-                (zone_x, h - 80),
-                GREEN,
-                2
-            )
-
-            cv2.line(
-                frame,
-                (right_limit, 0),
-                (right_limit, h - 80),
-                ORANGE,
-                1
-            )
-
-            cv2.putText(
-                frame,
-                "DETECTION ZONE (left -> right)",
-                (12, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                GREEN,
-                2
-            )
-
-            # ---------- BOTTOM DASHBOARD ----------
-
-            cv2.rectangle(
-                frame,
-                (0, h - 80),
-                (w, h),
-                (25, 25, 25),
-                -1
-            )
-
-            cv2.putText(
-                frame,
-                f"CAMERA: {camera_count}",
-                (12, h - 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                GREEN,
-                2
-            )
-
-            cv2.putText(
-                frame,
-                f"SCANNED: {scanned_count}",
-                (12, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                WHITE,
-                2
-            )
-
-            cv2.putText(
-                frame,
-                "[s] scan  [p] pay  [r] reset  [q] quit",
-                (max(w - 340, 0), h - 22),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                WHITE,
-                1
-            )
-
-            # ---------- PAYMENT VERDICT ----------
-
-            if (
-                verdict
-                and time.monotonic() - verdict[2] < 5
-            ):
-
-                if verdict[0] == "ok":
-                    color = GREEN
-                else:
-                    color = RED
-
-                cv2.rectangle(
-                    frame,
-                    (0, 35),
-                    (w, 80),
-                    color,
-                    -1
-                )
-
-                cv2.putText(
-                    frame,
-                    verdict[1],
-                    (12, 63),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    WHITE,
-                    2
-                )
 
             # ---------- DISPLAY WEBCAM ----------
 
-            cv2.imshow("ScanGuard - ByteTrack v1.3", frame)
+            cv2.imshow(
+                "ScanGuard - Improved Detection",
+                frame
+            )
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -494,22 +583,22 @@ def main():
             if key in (ord("q"), 27):
                 break
 
-            # Simulate scan
+            # Simulated scan
             elif key == ord("s"):
 
                 scanned_count += 1
 
                 print(
                     f"Product scanned! "
-                    f"Total scanned: {scanned_count}"
+                    f"Total: {scanned_count}"
                 )
 
-            # Reset transaction
+            # Reset
             elif key == ord("r"):
 
                 reset_transaction()
 
-            # Check payment
+            # Payment
             elif key == ord("p"):
 
                 check_payment()
