@@ -2,16 +2,19 @@
 """
 ScanGuard — AI-Powered Smart Checkout Monitoring
 ================================================
-Version 1.2 — Improved Object Tracking
+Version 1.3 — Duplicate Count Prevention
 
-Detects and tracks objects crossing a virtual detection zone
-using YOLOv8 and ByteTrack.
-
-Compares camera detections with simulated checkout scans.
+Features:
+- YOLOv8 object detection
+- ByteTrack object tracking
+- Left-to-right crossing detection
+- Temporary tracking ID recovery
+- Duplicate count reduction
+- Simulated checkout and payment verification
 
 Controls:
-    S     -> Scan an item
-    P     -> Finish payment and check for discrepancies
+    S     -> Scan a product
+    P     -> Finish payment
     R     -> Reset transaction
     Q/Esc -> Quit
 """
@@ -33,6 +36,11 @@ ZONE_X_RATIO = 0.55
 ZONE_MARGIN = 25
 CONF = 0.4
 
+# Temporary tracking ID recovery
+RECONNECT_DISTANCE = 70
+RECONNECT_TIME = 1.5
+
+# Colors (OpenCV uses BGR)
 GREEN = (90, 220, 140)
 WHITE = (255, 255, 255)
 ORANGE = (0, 165, 255)
@@ -45,8 +53,7 @@ TRACKER_PATH = BASE_DIR / "custom_bytetrack.yaml"
 
 if not TRACKER_PATH.is_file():
     raise SystemExit(
-        "Missing custom_bytetrack.yaml. "
-        "Create it in the same folder as scanguard_webcam.py."
+        "Missing custom_bytetrack.yaml."
     )
 
 model = YOLO(str(MODEL_PATH))
@@ -58,67 +65,171 @@ camera_count = 0
 scanned_count = 0
 verdict = None
 
-# track_id -> {"armed": bool, "counted": bool}
+# Each tracked object stores:
+# center: last known position
+# name: detected object class
+# last_seen: last detection time
+# armed: object observed left of the zone
+# counted: object already counted
 tracks = {}
 
 
 # ---------- OBJECT TRACKING ----------
 
 def update_tracks(results, zone_x):
+
     global camera_count
 
-    if results.boxes.id is None:
-        return
+    now = time.monotonic()
 
     left_limit = zone_x - ZONE_MARGIN
     right_limit = zone_x + ZONE_MARGIN
 
-    for box in results.boxes:
+    active_ids = set()
 
-        name = model.names[int(box.cls)]
+    # Find all currently tracked IDs
+    if results.boxes.id is not None:
 
-        if name not in CLASSES_OF_INTEREST:
+        for box in results.boxes:
+
+            name = model.names[int(box.cls)]
+
+            if name not in CLASSES_OF_INTEREST:
+                continue
+
+            active_ids.add(int(box.id.item()))
+
+        # Process tracked objects
+        for box in results.boxes:
+
+            name = model.names[int(box.cls)]
+
+            if name not in CLASSES_OF_INTEREST:
+                continue
+
+            track_id = int(box.id.item())
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+
+            # ---------- NEW TRACKING ID ----------
+
+            if track_id not in tracks:
+
+                previous_id = None
+                best_distance = RECONNECT_DISTANCE
+
+                # Search recently disappeared objects
+                for old_id, old in tracks.items():
+
+                    # Never match an object still visible
+                    if old_id in active_ids:
+                        continue
+
+                    # Only recover previously counted objects
+                    if not old["counted"]:
+                        continue
+
+                    # Require matching object category
+                    if old["name"] != name:
+                        continue
+
+                    # Require recent disappearance
+                    if now - old["last_seen"] > RECONNECT_TIME:
+                        continue
+
+                    old_x, old_y = old["center"]
+
+                    dx = center_x - old_x
+                    dy = center_y - old_y
+
+                    distance = (dx * dx + dy * dy) ** 0.5
+
+                    if distance < best_distance:
+
+                        best_distance = distance
+                        previous_id = old_id
+
+                # ---------- RECOVER OLD OBJECT ----------
+
+                if previous_id is not None:
+
+                    old_track = tracks.pop(previous_id)
+
+                    tracks[track_id] = {
+                        "center": (center_x, center_y),
+                        "name": name,
+                        "last_seen": now,
+                        "armed": old_track["armed"],
+                        "counted": True
+                    }
+
+                    print(
+                        f"Possible ID recovery: "
+                        f"{previous_id} -> {track_id}"
+                    )
+
+                # ---------- CREATE NEW OBJECT ----------
+
+                else:
+
+                    tracks[track_id] = {
+                        "center": (center_x, center_y),
+                        "name": name,
+                        "last_seen": now,
+                        "armed": False,
+                        "counted": False
+                    }
+
+            # ---------- UPDATE OBJECT STATE ----------
+
+            current = tracks[track_id]
+
+            # Arm object when it reaches the left zone
+            if center_x <= left_limit:
+                current["armed"] = True
+
+            # Count when it reaches the right zone
+            if (
+                current["armed"]
+                and not current["counted"]
+                and center_x >= right_limit
+            ):
+
+                camera_count += 1
+                current["counted"] = True
+
+                print(
+                    f"Product counted! "
+                    f"ID: {track_id} | "
+                    f"Class: {name} | "
+                    f"Total: {camera_count}"
+                )
+
+            # Save latest position and timestamp
+            current["center"] = (center_x, center_y)
+            current["name"] = name
+            current["last_seen"] = now
+
+    # ---------- CLEAN OLD TRACKS ----------
+
+    for old_id in list(tracks):
+
+        if old_id in active_ids:
             continue
 
-        track_id = int(box.id.item())
+        age = now - tracks[old_id]["last_seen"]
 
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        center_x = (x1 + x2) // 2
-
-        # First time detecting this object
-        if track_id not in tracks:
-            tracks[track_id] = {
-                "armed": False,
-                "counted": False
-            }
-
-        current = tracks[track_id]
-
-        # Object reaches the left zone
-        if center_x <= left_limit:
-            current["armed"] = True
-
-        # Object moves from left zone to right zone
-        if (
-            current["armed"]
-            and not current["counted"]
-            and center_x >= right_limit
-        ):
-
-            camera_count += 1
-            current["counted"] = True
-
-            print(
-                f"Product counted! "
-                f"ID: {track_id} | "
-                f"Class: {name} | "
-                f"Camera total: {camera_count}"
-            )
+        if age > RECONNECT_TIME:
+            del tracks[old_id]
 
 
 # ---------- RESET TRANSACTION ----------
 
 def reset_transaction():
+
     global camera_count, scanned_count, verdict
 
     camera_count = 0
@@ -127,7 +238,7 @@ def reset_transaction():
 
     tracks.clear()
 
-    # Reset ByteTrack's internal tracking state
+    # Reset ByteTrack's internal state
     if model.predictor is not None:
 
         trackers = getattr(
@@ -145,6 +256,7 @@ def reset_transaction():
 # ---------- PAYMENT CHECK ----------
 
 def check_payment():
+
     global verdict
 
     if scanned_count >= camera_count:
@@ -153,7 +265,7 @@ def check_payment():
             "ok",
             f"CLEARED: {camera_count} detected / "
             f"{scanned_count} scanned",
-            time.time()
+            time.monotonic()
         )
 
         print("Transaction cleared.")
@@ -165,7 +277,7 @@ def check_payment():
         verdict = (
             "alarm",
             f"ALERT: {difference} potentially unscanned item(s)",
-            time.time()
+            time.monotonic()
         )
 
         print(
@@ -176,6 +288,7 @@ def check_payment():
 # ---------- MAIN APPLICATION ----------
 
 def main():
+
     global scanned_count
 
     cap = cv2.VideoCapture(0)
@@ -200,7 +313,7 @@ def main():
             left_limit = zone_x - ZONE_MARGIN
             right_limit = zone_x + ZONE_MARGIN
 
-            # ---------- YOLO + CUSTOM BYTETRACK ----------
+            # ---------- YOLO + BYTETRACK ----------
 
             results = model.track(
                 frame,
@@ -210,7 +323,7 @@ def main():
                 verbose=False
             )[0]
 
-            # ---------- UPDATE OBJECT COUNT ----------
+            # ---------- UPDATE TRACKS ----------
 
             update_tracks(results, zone_x)
 
@@ -231,19 +344,21 @@ def main():
                     else -1
                 )
 
-                label = f"{name} ID:{track_id}"
-
-                # Orange means the object was already counted
-                if (
+                # Check whether object was counted
+                counted = (
                     track_id in tracks
                     and tracks[track_id]["counted"]
-                ):
+                )
+
+                if counted:
                     color = ORANGE
+                    label = f"{name} ID:{track_id} COUNTED"
 
                 else:
                     color = GREEN
+                    label = f"{name} ID:{track_id}"
 
-                # Draw bounding box
+                # Bounding box
                 cv2.rectangle(
                     frame,
                     (x1, y1),
@@ -252,7 +367,7 @@ def main():
                     2
                 )
 
-                # Display object class and tracking ID
+                # Object label
                 cv2.putText(
                     frame,
                     label,
@@ -265,7 +380,6 @@ def main():
 
             # ---------- DETECTION ZONE ----------
 
-            # Left boundary
             cv2.line(
                 frame,
                 (left_limit, 0),
@@ -274,7 +388,6 @@ def main():
                 1
             )
 
-            # Central line
             cv2.line(
                 frame,
                 (zone_x, 0),
@@ -283,7 +396,6 @@ def main():
                 2
             )
 
-            # Right boundary
             cv2.line(
                 frame,
                 (right_limit, 0),
@@ -344,13 +456,15 @@ def main():
 
             # ---------- PAYMENT VERDICT ----------
 
-            if verdict and time.time() - verdict[2] < 5:
+            if (
+                verdict
+                and time.monotonic() - verdict[2] < 5
+            ):
 
-                color = (
-                    GREEN
-                    if verdict[0] == "ok"
-                    else RED
-                )
+                if verdict[0] == "ok":
+                    color = GREEN
+                else:
+                    color = RED
 
                 cv2.rectangle(
                     frame,
@@ -372,7 +486,7 @@ def main():
 
             # ---------- DISPLAY WEBCAM ----------
 
-            cv2.imshow("ScanGuard - ByteTrack v1.2", frame)
+            cv2.imshow("ScanGuard - ByteTrack v1.3", frame)
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -380,7 +494,7 @@ def main():
             if key in (ord("q"), 27):
                 break
 
-            # Simulate product scan
+            # Simulate scan
             elif key == ord("s"):
 
                 scanned_count += 1
@@ -395,7 +509,7 @@ def main():
 
                 reset_transaction()
 
-            # Finish payment
+            # Check payment
             elif key == ord("p"):
 
                 check_payment()
