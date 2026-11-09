@@ -2,20 +2,19 @@
 """
 ScanGuard — AI-Powered Smart Checkout Monitoring
 ================================================
-Version 1.3.1 — Improved Detection
+Version 1.3.2 — Tracking and Counting Diagnostics
 
 Features:
 - YOLOv8 object detection
-- ByteTrack object tracking
-- Improved detection of smaller objects
+- Custom ByteTrack tracking
 - Tracking IDs displayed on webcam
-- Detection zone with hysteresis
-- Temporary tracking ID recovery
-- Simulated product scanning
-- Payment discrepancy alerts
+- Left-to-right crossing detection
+- Temporary ID recovery
+- Debugging for missed object counts
+- Simulated checkout and payment verification
 
 Controls:
-    S     -> Scan an item
+    S     -> Scan a product
     P     -> Finish payment
     R     -> Reset transaction
     Q/Esc -> Quit
@@ -34,39 +33,31 @@ CLASSES_OF_INTEREST = {
     "book", "cell phone", "remote", "mouse", "scissors"
 }
 
-# Detection
 CONF = 0.20
 IMAGE_SIZE = 960
 
-# Webcam requested resolution
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 
-# Counting zone
 ZONE_X_RATIO = 0.55
 ZONE_MARGIN = 25
 
-# Temporary object recovery
 RECONNECT_DISTANCE = 70
 RECONNECT_TIME = 1.5
 
-# Colors (BGR)
 GREEN = (90, 220, 140)
 WHITE = (255, 255, 255)
 ORANGE = (0, 165, 255)
 RED = (50, 50, 230)
 DARK = (25, 25, 25)
 
-# Files
 BASE_DIR = Path(__file__).resolve().parent
 
 MODEL_PATH = BASE_DIR / "yolov8n.pt"
 TRACKER_PATH = BASE_DIR / "custom_bytetrack.yaml"
 
 if not TRACKER_PATH.is_file():
-    raise SystemExit(
-        "Missing custom_bytetrack.yaml"
-    )
+    raise SystemExit("Missing custom_bytetrack.yaml")
 
 model = YOLO(str(MODEL_PATH))
 
@@ -77,8 +68,7 @@ camera_count = 0
 scanned_count = 0
 verdict = None
 
-# Each tracked object stores:
-# center, name, last_seen, armed, counted
+# track_id -> object information
 tracks = {}
 
 
@@ -95,7 +85,7 @@ def update_tracks(results, zone_x):
 
     active_ids = set()
 
-    # Collect visible tracking IDs
+    # Collect IDs currently visible
     for box in results.boxes:
 
         name = model.names[int(box.cls.item())]
@@ -106,7 +96,7 @@ def update_tracks(results, zone_x):
         if box.id is not None:
             active_ids.add(int(box.id.item()))
 
-    # Process tracked detections
+    # Process tracked objects
     for box in results.boxes:
 
         name = model.names[int(box.cls.item())]
@@ -114,8 +104,8 @@ def update_tracks(results, zone_x):
         if name not in CLASSES_OF_INTEREST:
             continue
 
-        # Some YOLO detections do not have a tracking ID
         if box.id is None:
+            print(f"DETECTED BUT NOT TRACKED: {name}")
             continue
 
         track_id = int(box.id.item())
@@ -134,7 +124,7 @@ def update_tracks(results, zone_x):
             previous_id = None
             best_distance = RECONNECT_DISTANCE
 
-            # Try to reconnect a recently lost track
+            # Look for a recently lost counted object
             for old_id, old in tracks.items():
 
                 if old_id in active_ids:
@@ -146,9 +136,7 @@ def update_tracks(results, zone_x):
                 if old["name"] != name:
                     continue
 
-                age = now - old["last_seen"]
-
-                if age > RECONNECT_TIME:
+                if now - old["last_seen"] > RECONNECT_TIME:
                     continue
 
                 old_x, old_y = old["center"]
@@ -163,7 +151,6 @@ def update_tracks(results, zone_x):
                     best_distance = distance
                     previous_id = old_id
 
-            # Recover possible previous identity
             if previous_id is not None:
 
                 old_track = tracks.pop(previous_id)
@@ -199,7 +186,18 @@ def update_tracks(results, zone_x):
         if center_x <= left_limit:
             current["armed"] = True
 
-        # Count when reaching the right side
+        # Diagnostic output
+        print(
+            f"ID: {track_id} | "
+            f"Object: {name} | "
+            f"Center: {center_x} | "
+            f"Armed: {current['armed']} | "
+            f"Counted: {current['counted']} | "
+            f"Left: {left_limit} | "
+            f"Right: {right_limit}"
+        )
+
+        # Count when object reaches right zone
         if (
             current["armed"]
             and not current["counted"]
@@ -210,17 +208,18 @@ def update_tracks(results, zone_x):
             current["counted"] = True
 
             print(
-                f"COUNTED: {name} | "
+                f"PRODUCT COUNTED! "
                 f"ID: {track_id} | "
+                f"Class: {name} | "
                 f"Total: {camera_count}"
             )
 
-        # Save latest information
+        # Save latest position
         current["center"] = (center_x, center_y)
         current["name"] = name
         current["last_seen"] = now
 
-    # ---------- REMOVE OLD RECORDS ----------
+    # ---------- REMOVE OLD TRACKS ----------
 
     for old_id in list(tracks):
 
@@ -245,7 +244,7 @@ def reset_transaction():
 
     tracks.clear()
 
-    # Reset ByteTrack
+    # Reset ByteTrack internal state
     if model.predictor is not None:
 
         trackers = getattr(
@@ -301,10 +300,10 @@ def draw_interface(frame, results, zone_x, fps):
     left_limit = zone_x - ZONE_MARGIN
     right_limit = zone_x + ZONE_MARGIN
 
-    # ---------- DETECTED OBJECTS ----------
-
     detections = 0
-    tracked = 0
+    tracked_count = 0
+
+    # ---------- DRAW OBJECTS ----------
 
     for box in results.boxes:
 
@@ -324,19 +323,29 @@ def draw_interface(frame, results, zone_x, fps):
         if box.id is not None:
 
             track_id = int(box.id.item())
-            tracked += 1
+            tracked_count += 1
 
             counted = (
                 track_id in tracks
                 and tracks[track_id]["counted"]
             )
 
+            armed = (
+                track_id in tracks
+                and tracks[track_id]["armed"]
+            )
+
             if counted:
                 color = ORANGE
                 status = "COUNTED"
-            else:
+
+            elif armed:
                 color = GREEN
-                status = ""
+                status = "ARMED"
+
+            else:
+                color = WHITE
+                status = "NOT ARMED"
 
             label = (
                 f"{name} ID:{track_id} "
@@ -345,13 +354,8 @@ def draw_interface(frame, results, zone_x, fps):
 
         else:
 
-            # Still display detections without tracking IDs
             color = ORANGE
-
-            label = (
-                f"{name} {confidence:.2f} "
-                f"UNTRACKED"
-            )
+            label = f"{name} {confidence:.2f} UNTRACKED"
 
         cv2.rectangle(
             frame,
@@ -381,13 +385,13 @@ def draw_interface(frame, results, zone_x, fps):
 
         cv2.line(
             frame,
-            (position, 35),
+            (position, 75),
             (position, h - 90),
             color,
             thickness
         )
 
-    # ---------- TOP INFORMATION ----------
+    # ---------- TOP PANEL ----------
 
     cv2.rectangle(
         frame,
@@ -399,7 +403,7 @@ def draw_interface(frame, results, zone_x, fps):
 
     cv2.putText(
         frame,
-        "ScanGuard v1.3.1 - Improved Detection",
+        "ScanGuard v1.3.2 - Counting Diagnostics",
         (12, 25),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -410,7 +414,7 @@ def draw_interface(frame, results, zone_x, fps):
     cv2.putText(
         frame,
         f"Detected: {detections} | "
-        f"Tracked: {tracked} | "
+        f"Tracked: {tracked_count} | "
         f"FPS: {fps:.1f}",
         (12, 55),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -419,7 +423,7 @@ def draw_interface(frame, results, zone_x, fps):
         1
     )
 
-    # ---------- BOTTOM DASHBOARD ----------
+    # ---------- BOTTOM PANEL ----------
 
     cv2.rectangle(
         frame,
@@ -459,15 +463,11 @@ def draw_interface(frame, results, zone_x, fps):
         1
     )
 
-    # ---------- PAYMENT ALERT ----------
+    # ---------- PAYMENT VERDICT ----------
 
     if verdict and time.monotonic() - verdict[2] < 5:
 
-        color = (
-            GREEN
-            if verdict[0] == "ok"
-            else RED
-        )
+        color = GREEN if verdict[0] == "ok" else RED
 
         cv2.rectangle(
             frame,
@@ -488,7 +488,7 @@ def draw_interface(frame, results, zone_x, fps):
         )
 
 
-# ---------- MAIN APPLICATION ----------
+# ---------- MAIN ----------
 
 def main():
 
@@ -496,26 +496,17 @@ def main():
 
     cap = cv2.VideoCapture(0)
 
-    # Request higher webcam resolution
-    cap.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        CAMERA_WIDTH
-    )
-
-    cap.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        CAMERA_HEIGHT
-    )
-
     if not cap.isOpened():
-        raise SystemExit("No webcam found.")
+        raise SystemExit("Webcam not found.")
 
-    actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
 
     print(
-        f"Camera resolution: "
-        f"{actual_width:.0f}x{actual_height:.0f}"
+        "Camera resolution:",
+        int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        "x",
+        int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     )
 
     previous_time = time.monotonic()
@@ -545,45 +536,36 @@ def main():
                 verbose=False
             )[0]
 
-            # ---------- UPDATE OBJECT COUNT ----------
+            # ---------- UPDATE COUNT ----------
 
             update_tracks(results, zone_x)
 
             # ---------- FPS ----------
 
-            current_time = time.monotonic()
-            elapsed = current_time - previous_time
+            now = time.monotonic()
 
-            if elapsed > 0:
-                fps = 1.0 / elapsed
-            else:
-                fps = 0.0
+            elapsed = now - previous_time
 
-            previous_time = current_time
+            fps = 1.0 / elapsed if elapsed > 0 else 0.0
+
+            previous_time = now
 
             # ---------- DRAW INTERFACE ----------
 
-            draw_interface(
-                frame,
-                results,
-                zone_x,
-                fps
-            )
+            draw_interface(frame, results, zone_x, fps)
 
-            # ---------- DISPLAY WEBCAM ----------
+            # ---------- DISPLAY ----------
 
             cv2.imshow(
-                "ScanGuard - Improved Detection",
+                "ScanGuard - Counting Diagnostics",
                 frame
             )
 
             key = cv2.waitKey(1) & 0xFF
 
-            # Quit
             if key in (ord("q"), 27):
                 break
 
-            # Simulated scan
             elif key == ord("s"):
 
                 scanned_count += 1
@@ -593,12 +575,10 @@ def main():
                     f"Total: {scanned_count}"
                 )
 
-            # Reset
             elif key == ord("r"):
 
                 reset_transaction()
 
-            # Payment
             elif key == ord("p"):
 
                 check_payment()
