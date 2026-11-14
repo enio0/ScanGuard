@@ -1,590 +1,136 @@
 
-"""
-ScanGuard — AI-Powered Smart Checkout Monitoring
-================================================
-Version 1.3.2 — Tracking and Counting Diagnostics
-
-Features:
-- YOLOv8 object detection
-- Custom ByteTrack tracking
-- Tracking IDs displayed on webcam
-- Left-to-right crossing detection
-- Temporary ID recovery
-- Debugging for missed object counts
-- Simulated checkout and payment verification
-
-Controls:
-    S     -> Scan a product
-    P     -> Finish payment
-    R     -> Reset transaction
-    Q/Esc -> Quit
-"""
+import time
 
 import cv2
-import time
-from pathlib import Path
 from ultralytics import YOLO
 
-
-# ---------- CONFIGURATION ----------
-
-CLASSES_OF_INTEREST = {
-    "bottle", "cup", "banana", "apple", "orange",
-    "book", "cell phone", "remote", "mouse", "scissors"
-}
-
-CONF = 0.20
-IMAGE_SIZE = 960
-
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 720
-
-ZONE_X_RATIO = 0.55
-ZONE_MARGIN = 25
-
-RECONNECT_DISTANCE = 70
-RECONNECT_TIME = 1.5
-
-GREEN = (90, 220, 140)
-WHITE = (255, 255, 255)
-ORANGE = (0, 165, 255)
-RED = (50, 50, 230)
-DARK = (25, 25, 25)
-
-BASE_DIR = Path(__file__).resolve().parent
-
-MODEL_PATH = BASE_DIR / "yolov8n.pt"
-TRACKER_PATH = BASE_DIR / "custom_bytetrack.yaml"
-
-if not TRACKER_PATH.is_file():
-    raise SystemExit("Missing custom_bytetrack.yaml")
-
-model = YOLO(str(MODEL_PATH))
-
-
-# ---------- GLOBAL VARIABLES ----------
-
-camera_count = 0
-scanned_count = 0
-verdict = None
-
-# track_id -> object information
-tracks = {}
-
-
-# ---------- OBJECT TRACKING ----------
-
-def update_tracks(results, zone_x):
-
-    global camera_count
-
-    now = time.monotonic()
-
-    left_limit = zone_x - ZONE_MARGIN
-    right_limit = zone_x + ZONE_MARGIN
-
-    active_ids = set()
-
-    # Collect IDs currently visible
-    for box in results.boxes:
-
-        name = model.names[int(box.cls.item())]
-
-        if name not in CLASSES_OF_INTEREST:
-            continue
-
-        if box.id is not None:
-            active_ids.add(int(box.id.item()))
-
-    # Process tracked objects
-    for box in results.boxes:
-
-        name = model.names[int(box.cls.item())]
-
-        if name not in CLASSES_OF_INTEREST:
-            continue
-
-        if box.id is None:
-            print(f"DETECTED BUT NOT TRACKED: {name}")
-            continue
-
-        track_id = int(box.id.item())
-
-        x1, y1, x2, y2 = map(
-            int, box.xyxy[0].tolist()
-        )
-
-        center_x = (x1 + x2) // 2
-        center_y = (y1 + y2) // 2
-
-        # ---------- NEW TRACK ----------
-
-        if track_id not in tracks:
-
-            previous_id = None
-            best_distance = RECONNECT_DISTANCE
-
-            # Look for a recently lost counted object
-            for old_id, old in tracks.items():
-
-                if old_id in active_ids:
-                    continue
-
-                if not old["counted"]:
-                    continue
-
-                if old["name"] != name:
-                    continue
-
-                if now - old["last_seen"] > RECONNECT_TIME:
-                    continue
-
-                old_x, old_y = old["center"]
-
-                dx = center_x - old_x
-                dy = center_y - old_y
-
-                distance = (dx * dx + dy * dy) ** 0.5
-
-                if distance < best_distance:
-
-                    best_distance = distance
-                    previous_id = old_id
-
-            if previous_id is not None:
-
-                old_track = tracks.pop(previous_id)
-
-                tracks[track_id] = {
-                    "center": (center_x, center_y),
-                    "name": name,
-                    "last_seen": now,
-                    "armed": old_track["armed"],
-                    "counted": True
-                }
-
-                print(
-                    f"Possible ID recovery: "
-                    f"{previous_id} -> {track_id}"
-                )
-
-            else:
-
-                tracks[track_id] = {
-                    "center": (center_x, center_y),
-                    "name": name,
-                    "last_seen": now,
-                    "armed": False,
-                    "counted": False
-                }
-
-        # ---------- UPDATE TRACK ----------
-
-        current = tracks[track_id]
-
-        # Arm object on the left
-        if center_x <= left_limit:
-            current["armed"] = True
-
-        # Diagnostic output
-        print(
-            f"ID: {track_id} | "
-            f"Object: {name} | "
-            f"Center: {center_x} | "
-            f"Armed: {current['armed']} | "
-            f"Counted: {current['counted']} | "
-            f"Left: {left_limit} | "
-            f"Right: {right_limit}"
-        )
-
-        # Count when object reaches right zone
-        if (
-            current["armed"]
-            and not current["counted"]
-            and center_x >= right_limit
-        ):
-
-            camera_count += 1
-            current["counted"] = True
-
-            print(
-                f"PRODUCT COUNTED! "
-                f"ID: {track_id} | "
-                f"Class: {name} | "
-                f"Total: {camera_count}"
-            )
-
-        # Save latest position
-        current["center"] = (center_x, center_y)
-        current["name"] = name
-        current["last_seen"] = now
-
-    # ---------- REMOVE OLD TRACKS ----------
-
-    for old_id in list(tracks):
-
-        if old_id in active_ids:
-            continue
-
-        age = now - tracks[old_id]["last_seen"]
-
-        if age > RECONNECT_TIME:
-            del tracks[old_id]
-
-
-# ---------- RESET TRANSACTION ----------
-
-def reset_transaction():
-
-    global camera_count, scanned_count, verdict
+MODEL = "yolov8n.pt"
+CONFIDENCE = 0.35
+LINE_POSITION = 0.5
+MATCH_DISTANCE = 100
+TRACK_TIMEOUT = 1.0
+
+# These are the everyday objects recognized by the pretrained model.
+ITEMS = {"bottle", "cup", "banana", "apple", "orange", "book", "cell phone", "remote", "mouse", "scissors"}
+
+model = YOLO(MODEL)
+
+
+def main():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Could not open webcam.")
+        return
 
     camera_count = 0
     scanned_count = 0
-    verdict = None
-
-    tracks.clear()
-
-    # Reset ByteTrack internal state
-    if model.predictor is not None:
-
-        trackers = getattr(
-            model.predictor,
-            "trackers",
-            []
-        )
-
-        for tracker in trackers:
-            tracker.reset()
-
-    print("Transaction reset.")
-
-
-# ---------- PAYMENT CHECK ----------
-
-def check_payment():
-
-    global verdict
-
-    if scanned_count >= camera_count:
-
-        verdict = (
-            "ok",
-            f"CLEARED: {camera_count} detected / "
-            f"{scanned_count} scanned",
-            time.monotonic()
-        )
-
-        print("Transaction cleared.")
-
-    else:
-
-        difference = camera_count - scanned_count
-
-        verdict = (
-            "alarm",
-            f"ALERT: {difference} potentially unscanned item(s)",
-            time.monotonic()
-        )
-
-        print(
-            f"ALERT: {difference} potentially unscanned item(s)."
-        )
-
-
-# ---------- DRAW INTERFACE ----------
-
-def draw_interface(frame, results, zone_x, fps):
-
-    h, w = frame.shape[:2]
-
-    left_limit = zone_x - ZONE_MARGIN
-    right_limit = zone_x + ZONE_MARGIN
-
-    detections = 0
-    tracked_count = 0
-
-    # ---------- DRAW OBJECTS ----------
-
-    for box in results.boxes:
-
-        name = model.names[int(box.cls.item())]
-
-        if name not in CLASSES_OF_INTEREST:
-            continue
-
-        detections += 1
-
-        x1, y1, x2, y2 = map(
-            int, box.xyxy[0].tolist()
-        )
-
-        confidence = float(box.conf.item())
-
-        if box.id is not None:
-
-            track_id = int(box.id.item())
-            tracked_count += 1
-
-            counted = (
-                track_id in tracks
-                and tracks[track_id]["counted"]
-            )
-
-            armed = (
-                track_id in tracks
-                and tracks[track_id]["armed"]
-            )
-
-            if counted:
-                color = ORANGE
-                status = "COUNTED"
-
-            elif armed:
-                color = GREEN
-                status = "ARMED"
-
-            else:
-                color = WHITE
-                status = "NOT ARMED"
-
-            label = (
-                f"{name} ID:{track_id} "
-                f"{confidence:.2f} {status}"
-            )
-
-        else:
-
-            color = ORANGE
-            label = f"{name} {confidence:.2f} UNTRACKED"
-
-        cv2.rectangle(
-            frame,
-            (x1, y1),
-            (x2, y2),
-            color,
-            2
-        )
-
-        cv2.putText(
-            frame,
-            label,
-            (x1, max(y1 - 8, 15)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            2
-        )
-
-    # ---------- DETECTION ZONE ----------
-
-    for position, color, thickness in [
-        (left_limit, ORANGE, 1),
-        (zone_x, GREEN, 2),
-        (right_limit, ORANGE, 1)
-    ]:
-
-        cv2.line(
-            frame,
-            (position, 75),
-            (position, h - 90),
-            color,
-            thickness
-        )
-
-    # ---------- TOP PANEL ----------
-
-    cv2.rectangle(
-        frame,
-        (0, 0),
-        (w, 75),
-        DARK,
-        -1
-    )
-
-    cv2.putText(
-        frame,
-        "ScanGuard v1.3.2 - Counting Diagnostics",
-        (12, 25),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        GREEN,
-        2
-    )
-
-    cv2.putText(
-        frame,
-        f"Detected: {detections} | "
-        f"Tracked: {tracked_count} | "
-        f"FPS: {fps:.1f}",
-        (12, 55),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        WHITE,
-        1
-    )
-
-    # ---------- BOTTOM PANEL ----------
-
-    cv2.rectangle(
-        frame,
-        (0, h - 90),
-        (w, h),
-        DARK,
-        -1
-    )
-
-    cv2.putText(
-        frame,
-        f"CAMERA: {camera_count}",
-        (12, h - 58),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        GREEN,
-        2
-    )
-
-    cv2.putText(
-        frame,
-        f"SCANNED: {scanned_count}",
-        (12, h - 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        WHITE,
-        2
-    )
-
-    cv2.putText(
-        frame,
-        "[S] Scan  [P] Pay  [R] Reset  [Q] Quit",
-        (12, h - 7),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        WHITE,
-        1
-    )
-
-    # ---------- PAYMENT VERDICT ----------
-
-    if verdict and time.monotonic() - verdict[2] < 5:
-
-        color = GREEN if verdict[0] == "ok" else RED
-
-        cv2.rectangle(
-            frame,
-            (0, 80),
-            (w, 125),
-            color,
-            -1
-        )
-
-        cv2.putText(
-            frame,
-            verdict[1],
-            (12, 108),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            WHITE,
-            2
-        )
-
-
-# ---------- MAIN ----------
-
-def main():
-
-    global scanned_count
-
-    cap = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
-        raise SystemExit("Webcam not found.")
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-
-    print(
-        "Camera resolution:",
-        int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-        "x",
-        int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    )
-
-    previous_time = time.monotonic()
+    tracks = {}  # id: {x, y, last_seen, counted}
+    next_id = 0
+    message = ""
+    message_time = 0
 
     try:
-
         while True:
-
             ok, frame = cap.read()
-
             if not ok:
-                print("Unable to read webcam frame.")
                 break
 
-            h, w = frame.shape[:2]
-
-            zone_x = int(w * ZONE_X_RATIO)
-
-            # ---------- YOLO + BYTETRACK ----------
-
-            results = model.track(
-                frame,
-                persist=True,
-                tracker=str(TRACKER_PATH),
-                conf=CONF,
-                imgsz=IMAGE_SIZE,
-                verbose=False
-            )[0]
-
-            # ---------- UPDATE COUNT ----------
-
-            update_tracks(results, zone_x)
-
-            # ---------- FPS ----------
-
+            height, width = frame.shape[:2]
+            line_x = int(width * LINE_POSITION)
             now = time.monotonic()
+            result = model.predict(frame, conf=CONFIDENCE, verbose=False)[0]
+            detections = []
 
-            elapsed = now - previous_time
+            for box in result.boxes:
+                name = model.names[int(box.cls.item())]
+                if name not in ITEMS:
+                    continue
 
-            fps = 1.0 / elapsed if elapsed > 0 else 0.0
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                detections.append((cx, cy, name, (x1, y1, x2, y2)))
 
-            previous_time = now
+            # Match each detection to a nearby object from the previous frames.
+            matches = set()
+            for cx, cy, name, bounds in detections:
+                chosen_id = None
+                best_distance = MATCH_DISTANCE
+                for track_id, track in tracks.items():
+                    if track_id in matches or track["name"] != name:
+                        continue
+                    if now - track["last_seen"] > TRACK_TIMEOUT:
+                        continue
+                    distance = ((cx - track["x"]) ** 2 + (cy - track["y"]) ** 2) ** 0.5
+                    if distance < best_distance:
+                        chosen_id = track_id
+                        best_distance = distance
 
-            # ---------- DRAW INTERFACE ----------
+                if chosen_id is None:
+                    chosen_id = next_id
+                    next_id += 1
+                    tracks[chosen_id] = {
+                        "x": cx, "y": cy, "name": name,
+                        "last_seen": now, "counted": False
+                    }
+                else:
+                    track = tracks[chosen_id]
+                    if not track["counted"] and track["x"] < line_x <= cx:
+                        camera_count += 1
+                        track["counted"] = True
+                        print(f"Counted: {name} (camera total: {camera_count})")
+                    track["x"] = cx
+                    track["y"] = cy
+                    track["last_seen"] = now
 
-            draw_interface(frame, results, zone_x, fps)
+                matches.add(chosen_id)
+                x1, y1, x2, y2 = bounds
+                color = (0, 165, 255) if tracks[chosen_id]["counted"] else (80, 220, 120)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, name, (x1, max(20, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # ---------- DISPLAY ----------
+            # Forget objects that have left the scene.
+            tracks = {
+                track_id: track for track_id, track in tracks.items()
+                if now - track["last_seen"] <= TRACK_TIMEOUT
+            }
 
-            cv2.imshow(
-                "ScanGuard - Counting Diagnostics",
-                frame
-            )
+            cv2.line(frame, (line_x, 0), (line_x, height), (80, 220, 120), 2)
+            cv2.rectangle(frame, (0, height - 85), (width, height), (30, 30, 30), -1)
+            cv2.putText(frame, f"Camera: {camera_count}   Scanned: {scanned_count}",
+                        (12, height - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (255, 255, 255), 2)
+            cv2.putText(frame, "S: scan   P: pay   R: reset   Q: quit",
+                        (12, height - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (255, 255, 255), 1)
 
+            if message and now - message_time < 4:
+                cv2.rectangle(frame, (0, 0), (width, 45), (30, 30, 30), -1)
+                cv2.putText(frame, message, (12, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65, (255, 255, 255), 2)
+
+            cv2.imshow("ScanGuard", frame)
             key = cv2.waitKey(1) & 0xFF
-
             if key in (ord("q"), 27):
                 break
-
-            elif key == ord("s"):
-
+            if key == ord("s"):
                 scanned_count += 1
-
-                print(
-                    f"Product scanned! "
-                    f"Total: {scanned_count}"
-                )
-
-            elif key == ord("r"):
-
-                reset_transaction()
-
+                print(f"Scanned: {scanned_count}")
             elif key == ord("p"):
-
-                check_payment()
-
+                if camera_count > scanned_count:
+                    message = f"Check: {camera_count - scanned_count} possible unscanned item(s)"
+                else:
+                    message = "Counts match (or more items were scanned)"
+                message_time = time.monotonic()
+                print(message)
+            elif key == ord("r"):
+                camera_count = 0
+                scanned_count = 0
+                tracks.clear()
+                message = ""
+                print("Reset")
     finally:
-
         cap.release()
         cv2.destroyAllWindows()
 
